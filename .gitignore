@@ -1,0 +1,11 @@
+.env
+.venv/
+venv/
+__pycache__/
+*.pyc
+enterprise_bi.duckdb
+enterprise_bi.duckdb.wal
+chroma_db/
+feedback_journal.jsonl
+.DS_Store
+.pytest_cache/

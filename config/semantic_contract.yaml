@@ -1,0 +1,172 @@
+# =============================================================================
+# ENTERPRISE BI ENGINE - KPI SEMANTIC CONTRACT
+# =============================================================================
+# The single declarative source of truth for what every KPI MEANS.
+#
+# Read at runtime by watcher/ (thresholds, calculations) and app.py (access
+# control, display, lineage captions). Changing a definition here changes
+# system behaviour - definitions are never duplicated in code.
+#
+# Round 2 brief, minimum prototype expectation #2: "a lightweight semantic
+# contract or KPI dictionary that covers calculations, definitions, drivers,
+# thresholds, access restrictions, and lineage."
+# =============================================================================
+
+version: 1
+entity: "RavenStack SaaS (synthetic enterprise)"
+calendar:
+  fiscal_year_start: "04-01"
+  week_starts_on: "monday"
+  timezone: "UTC"
+  note: >
+    All sources are normalised to UTC before comparison. billing_mrr closes at
+    23:59 UTC; platform_telemetry is minute-grain streaming. This is the
+    "inconsistent calendars" reconciliation the brief asks about.
+
+kpis:
+
+  mrr:
+    display_name: "MRR"
+    definition: >
+      Monthly Recurring Revenue: contracted subscription revenue normalised to
+      a monthly amount, measured at end of day.
+    calculation: "SELECT total_mrr FROM billing_mrr WHERE record_date = :as_of"
+    unit: "usd"
+    format: "currency"
+    grain: "daily"
+    refresh_cadence: "Daily batch, 02:00 UTC"
+    source_system: "Billing Database"
+    source_table: "billing_mrr"
+    lineage: "Stripe subscription ledger -> nightly ETL -> billing_mrr"
+    drivers: ["new_mrr", "churned_mrr", "failed_transactions_usd"]
+    materiality:
+      statistical: "abs(z_score) >= 2.5"
+      business: "abs(delta_usd) >= 25000"
+      rule: "both"        # material only if BOTH tests pass
+    access:
+      allow: ["VP of Revenue (Executive)"]
+      deny: ["Director of Engineering (Technical)"]
+      classification: "restricted-financial"
+      enforcement: "query-layer"   # the SELECT does not run for denied personas
+
+  churn_rate:
+    display_name: "Churn Rate"
+    definition: >
+      Share of recurring revenue lost to voluntary and involuntary cancellation
+      in the period, expressed as a percentage of total MRR.
+    calculation: "churned_mrr / total_mrr * 100"
+    unit: "percent"
+    format: "percent"
+    grain: "daily"
+    refresh_cadence: "Daily batch, 02:00 UTC"
+    source_system: "Billing Database"
+    source_table: "billing_mrr"
+    lineage: "Subscription cancellation events -> nightly ETL -> billing_mrr"
+    drivers: ["competitor_pricing", "payment_failure", "product_defect"]
+    materiality:
+      statistical: "abs(z_score) >= 2.0"
+      business: "abs(relative_change_pct) >= 10"
+      rule: "both"
+    access:
+      allow: ["VP of Revenue (Executive)", "Director of Engineering (Technical)"]
+      deny: []
+      classification: "internal"
+      enforcement: "query-layer"
+
+  gateway_timeout_errors:
+    display_name: "Gateway Errors"
+    definition: >
+      Count of payment gateway timeout errors observed by the platform in the
+      sampled minute.
+    calculation: "SELECT gateway_timeout_errors FROM platform_telemetry WHERE ts = :peak"
+    unit: "count"
+    format: "integer"
+    grain: "minute"
+    refresh_cadence: "Real-time stream"
+    source_system: "Product Telemetry"
+    source_table: "platform_telemetry"
+    lineage: "Application APM spans -> streaming ingest -> platform_telemetry"
+    drivers: ["stripe_api_version", "deploy_event", "upstream_outage"]
+    materiality:
+      statistical: "abs(z_score) >= 3.0"
+      business: "value >= 100"
+      rule: "either"
+    access:
+      allow: ["VP of Revenue (Executive)", "Director of Engineering (Technical)"]
+      deny: []
+      classification: "internal"
+      enforcement: "query-layer"
+
+  p99_latency_ms:
+    display_name: "P99 Latency"
+    definition: >
+      99th percentile end-to-end service latency for the migrated payment
+      gateway service.
+    calculation: "SELECT p99_latency_ms FROM aws_cloudwatch_latency WHERE ts = :peak"
+    unit: "ms"
+    format: "latency"
+    grain: "hourly"
+    refresh_cadence: "Hourly rollup"
+    source_system: "AWS CloudWatch"
+    source_table: "aws_cloudwatch_latency"
+    lineage: "CloudWatch metric filters -> hourly rollup -> aws_cloudwatch_latency"
+    drivers: ["service_migration", "instance_sizing", "connection_pool"]
+    sparse_history:
+      is_sparse: true
+      days_available: 3
+      minimum_days_for_baseline: 14
+      degraded_method: "range_check"
+      note: >
+        Newly migrated service. Fewer than 14 days of history means a z-score
+        baseline is not statistically supportable. The watcher degrades to a
+        bounded range check and marks the result low-power rather than
+        reporting a z-score it cannot defend.
+    materiality:
+      statistical: "insufficient_history"
+      business: "value >= 1000"
+      rule: "business_only"
+    access:
+      allow: ["VP of Revenue (Executive)", "Director of Engineering (Technical)"]
+      deny: []
+      classification: "internal"
+      enforcement: "query-layer"
+
+personas:
+  "VP of Revenue (Executive)":
+    short: "VP of Revenue"
+    lens: "business"
+    narrative_focus: >
+      Revenue impact, customer retention, and the commercial action that
+      recovers the most money soonest.
+    owns_levers: ["pricing", "retention_offer", "customer_comms"]
+  "Director of Engineering (Technical)":
+    short: "Director of Engineering"
+    lens: "technical"
+    narrative_focus: >
+      System root cause, failing component, and the rollback or remediation
+      procedure with its verification steps.
+    owns_levers: ["api_version", "rollback", "deploy_freeze", "capacity"]
+
+scenarios:
+  1:
+    key: "multi_factor"
+    label: "Multi-Factor Incident"
+    primary_kpi: "mrr"
+    as_of: "2026-08-25"
+    expected_state: "success"
+  2:
+    key: "ambiguous"
+    label: "Ambiguous Data"
+    primary_kpi: "churn_rate"
+    as_of: "2026-08-25"
+    expected_state: "abstain"
+  3:
+    key: "sparse_history"
+    label: "Sparse History"
+    primary_kpi: "p99_latency_ms"
+    as_of: "2026-08-25"
+    expected_state: "success"
+
+thresholds:
+  abstain_below_confidence: 60      # TR-011 / Build Step 6 safety gate
+  zscore_anomaly: 2.5
