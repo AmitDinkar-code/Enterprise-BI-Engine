@@ -221,6 +221,16 @@ tests/
 
 ---
 
+## Documents
+
+| Document | Purpose |
+|---|---|
+| [`docs/BUSINESS_PROPOSAL.md`](docs/BUSINESS_PROPOSAL.md) | Round 2 detailed business proposal — problem framing, solution design, business case, target users, risks, phased roadmap |
+| [`docs/EVALUATION_GUIDE.md`](docs/EVALUATION_GUIDE.md) | 63-check QA framework, brief-coverage record, 3-minute demo video script, and 12 judge Q&A defences |
+| `config/semantic_contract.yaml` | The KPI dictionary — definitions, calculations, thresholds, lineage, access rules |
+
+---
+
 ## Documented deviations
 
 Where the source documents disagree with each other, the resolution and its
