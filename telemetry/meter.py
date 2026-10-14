@@ -68,8 +68,8 @@ def _rate(name: str) -> float:
 
 def estimate_cost(prompt_tokens: int, completion_tokens: int) -> float:
     """USD estimate from configured per-million-token rates."""
-    inp = _rate("COST_PER_MTOK_INPUT")
-    out = _rate("COST_PER_MTOK_OUTPUT")
+    inp = _rate("INPUT_TOKEN_PRICE")
+    out = _rate("OUTPUT_TOKEN_PRICE")
     cost = (prompt_tokens / 1_000_000.0) * inp + (completion_tokens / 1_000_000.0) * out
     return round(cost, 6)
 

@@ -29,8 +29,22 @@ import asyncio
 import json
 import os
 import sys
+import time
 from dataclasses import dataclass, field
 from typing import Any
+
+_groq_client = None
+
+def _get_client():
+    """Singleton OpenAI client pointed at Groq's inference endpoint."""
+    global _groq_client
+    if _groq_client is None:
+        from openai import OpenAI
+        _groq_client = OpenAI(
+            api_key=os.getenv("GROQ_API_KEY"),
+            base_url="https://api.groq.com/openai/v1",
+        )
+    return _groq_client
 
 from dotenv import load_dotenv
 
@@ -153,18 +167,23 @@ SYSTEM_PROMPTS: dict[str, str] = {
     ),
     "Bear_Agent": (
         "You are Bear, arguing that the movement has an INTERNAL, controllable "
-        "cause - our own systems, deploys or defects. Build the strongest case "
+        "cause — our own systems, deploys or defects. Build the strongest case "
         "you honestly can in at most 130 words, citing evidence ids and the "
         "computed metrics that support you. Engage the strongest opposing "
         "point rather than ignoring it. Never present speculation as fact. "
+        "Write in a direct, professional tone as if speaking in a standard "
+        "business meeting. Avoid dramatic, poetic, or theatrical language. "
         + MATH_BAN
     ),
     "Bull_Agent": (
-        "You are Bull, arguing that the movement has an EXTERNAL cause - "
+        "You are Bull, arguing that the movement has an EXTERNAL cause — "
         "market, competitor or seasonal pressure outside our control. Build "
         "the strongest case you honestly can in at most 130 words, citing "
         "evidence ids and computed metrics. You must address contradictory "
-        "evidence rather than ignore it. " + MATH_BAN
+        "evidence rather than ignore it. "
+        "Write in a direct, professional tone as if speaking in a standard "
+        "business meeting. Avoid dramatic, poetic, or theatrical language. "
+        + MATH_BAN
     ),
     "Arbitrator_Agent": (
         "You are the Arbitrator. You did not argue; you judge. Weigh Bear "
@@ -188,100 +207,118 @@ SYSTEM_PROMPTS: dict[str, str] = {
         "value from computed_metrics. Keep each field under 30 words. "
         + MATH_BAN
     ),
+    "Debate_Agent": (
+        "You are a dual-agent system. First, argue that the movement has an INTERNAL, "
+        "controllable cause (Bear). Then, argue that it has an EXTERNAL cause (Bull). "
+        "Build the strongest honest cases you can, citing evidence ids and computed metrics. "
+        "Engage contradictory evidence. Keep both arguments under 150 words each. "
+        + MATH_BAN
+    ),
 }
 
-DEBATE_ORDER = ["Researcher_Agent", "Bear_Agent", "Bull_Agent"]
+DEBATE_ORDER = ["Debate_Agent"]
 
 
 # ===========================================================================
-# LIVE PATH - Microsoft AutoGen
+# LIVE PATH — Groq via OpenAI SDK
 # ===========================================================================
 
 def _llm_available() -> bool:
-    key = os.getenv("OPENAI_API_KEY", "").strip()
-    return bool(key) and not key.startswith("your-")
+    key = os.getenv("GROQ_API_KEY", "").strip()
+    return bool(key) and not key.startswith("placeholder")
 
 
-async def _run_autogen_debate(
-    context_blob: str, persona: str, meter: Meter
+def _run_groq_debate(
+    context_blob: str, persona: str, meter: Meter, model_name: str
 ) -> tuple[list[dict[str, str]], str]:
-    """Run Researcher -> Bear -> Bull through an AutoGen RoundRobinGroupChat."""
-    from autogen_agentchat.agents import AssistantAgent
-    from autogen_agentchat.teams import RoundRobinGroupChat
-    from autogen_agentchat.conditions import MaxMessageTermination
-    from autogen_ext.models.openai import OpenAIChatCompletionClient
-
-    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-    client = OpenAIChatCompletionClient(model=model, api_key=os.getenv("OPENAI_API_KEY"))
-
-    agents = [
-        AssistantAgent(
-            name=name,
-            model_client=client,
-            system_message=SYSTEM_PROMPTS[name],
-            # No tools, no code execution: the agents cannot reach the database.
-            tools=[],
-            reflect_on_tool_use=False,
-        )
-        for name in DEBATE_ORDER
-    ]
-
-    team = RoundRobinGroupChat(
-        agents, termination_condition=MaxMessageTermination(len(agents) + 1)
-    )
-
-    task = (
-        f"Persona in the room: {persona}.\n"
-        f"Diagnostic context (authoritative, computed deterministically):\n"
-        f"{context_blob}\n\n"
-        f"Researcher first, then Bear, then Bull. One turn each."
-    )
+    """Run Debate using the Groq inference endpoint via OpenAI SDK."""
+    model = model_name
+    client = _get_client()
 
     transcript: list[dict[str, str]] = []
-    result = await team.run(task=task)
-
-    for msg in result.messages:
-        source = getattr(msg, "source", "user")
-        content = getattr(msg, "content", "")
-        if source == "user" or not isinstance(content, str):
-            continue
-        transcript.append({"agent": source, "message": content.strip()})
-        usage = getattr(msg, "models_usage", None)
-        if usage is not None:
-            meter.record_call(
-                getattr(usage, "prompt_tokens", 0),
-                getattr(usage, "completion_tokens", 0),
+    for agent_name in DEBATE_ORDER:
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPTS[agent_name]},
+                    {"role": "user", "content": (
+                        f"Persona in the room: {persona}.\n"
+                        f"Diagnostic context (authoritative, computed deterministically):\n"
+                        f"{context_blob}\n\n"
+                        f"Return a concise answer only."
+                    )},
+                ],
+                temperature=0.2,
+                max_tokens=256,
             )
+            content = response.choices[0].message.content or ""
+            if content:
+                transcript.append({"agent": agent_name, "message": content.strip()})
+            usage = response.usage
+            if usage is not None:
+                meter.record_call(
+                    getattr(usage, "prompt_tokens", 0),
+                    getattr(usage, "completion_tokens", 0),
+                )
+        except Exception as exc:  # noqa: BLE001
+            # Graceful degradation: log the error and use a fallback message
+            transcript.append({"agent": agent_name, "message": f"[API Error: {exc}]"})
 
-    await client.close()
     return transcript, model
 
 
-async def _run_single_agent(
-    name: str, prompt: str, meter: Meter
+def _run_single_agent(
+    name: str, prompt: str, meter: Meter, model_name: str,
+    json_mode: bool = False,
 ) -> str:
-    """One-shot call for the Arbitrator and the Storyteller."""
-    from autogen_agentchat.agents import AssistantAgent
-    from autogen_ext.models.openai import OpenAIChatCompletionClient
+    """One-shot call for the Arbitrator and the Storyteller using Groq via OpenAI SDK."""
+    model = model_name
+    client = _get_client()
 
-    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-    client = OpenAIChatCompletionClient(model=model, api_key=os.getenv("OPENAI_API_KEY"))
-    agent = AssistantAgent(
-        name=name, model_client=client, system_message=SYSTEM_PROMPTS[name], tools=[]
-    )
-    result = await agent.run(task=prompt)
-    reply = ""
-    for msg in result.messages:
-        if getattr(msg, "source", "") == name:
-            reply = str(getattr(msg, "content", ""))
-        usage = getattr(msg, "models_usage", None)
+    kwargs: dict[str, Any] = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPTS[name]},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.2,
+        "max_tokens": 256,
+    }
+    if json_mode:
+        kwargs["response_format"] = {"type": "json_object"}
+
+    try:
+        response = client.chat.completions.create(**kwargs)
+        reply = response.choices[0].message.content or ""
+        usage = response.usage
         if usage is not None:
             meter.record_call(
                 getattr(usage, "prompt_tokens", 0),
                 getattr(usage, "completion_tokens", 0),
             )
-    await client.close()
-    return reply
+        return reply
+    except Exception as exc:  # noqa: BLE001
+        # Graceful degradation: return schema-correct fallback per agent type.
+        if name == "Arbitrator_Agent":
+            return json.dumps({
+                "winning_hypothesis": "none",
+                "confidence": 50,
+                "internal_confidence": 50,
+                "external_confidence": 50,
+                "rationale": f"Fallback applied due to API error: {exc}",
+            })
+        else:
+            # Storyteller 7-field ActionRecommendation schema
+            return json.dumps({
+                "driver": "API Timeout",
+                "controllable lever": "N/A",
+                "action": "N/A",
+                "expected impact": "N/A",
+                "owner": "N/A",
+                "confidence": 0,
+                "monitoring plan": "N/A",
+            })
 
 
 # ===========================================================================
@@ -531,6 +568,8 @@ def run_diagnostic_pipeline(
     persona: str,
     scenario: int,
     on_stage: Any = None,
+    use_live_mode: bool = True,
+    model_name: str = "qwen/qwen3.8-27b",
 ) -> DiagnosticResult:
     """
     Execute the full pipeline for one persona and scenario.
@@ -541,9 +580,9 @@ def run_diagnostic_pipeline(
         if on_stage:
             on_stage(name)
 
-    live = _llm_available()
-    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini") if live else "replay"
-    meter = Meter(model=model, mode="live" if live else "replay")
+    live = use_live_mode and _llm_available()
+    effective_model = model_name if live else "replay"
+    meter = Meter(model=effective_model, mode="live" if live else "replay")
     gate_log: list[str] = []
 
     # ---- 1. Deterministic watcher (no LLM) --------------------------------
@@ -575,13 +614,14 @@ def run_diagnostic_pipeline(
     # ---- 3. Adversarial debate -------------------------------------------
     stage("debate")
     if live:
-        transcript, model = asyncio.run(
-            _run_autogen_debate(context_blob, persona, meter)
+        transcript, effective_model = _run_groq_debate(
+            context_blob, persona, meter, model_name
         )
     else:
         transcript = _replay_debate(watcher, evidence, meter)
 
     # ---- 4. Arbitration ---------------------------------------------------
+    stage("arbitrator")
     separable, sep_reason = assess_separability(watcher)
     balanced, bal_reason = evidence_is_balanced(evidence)
 
@@ -595,7 +635,7 @@ def run_diagnostic_pipeline(
             f"({sep_reason}). Evidence balance: {bal_reason}.\n"
             f"Return the JSON verdict now."
         )
-        raw = asyncio.run(_run_single_agent("Arbitrator_Agent", arb_prompt, meter))
+        raw = _run_single_agent("Arbitrator_Agent", arb_prompt, meter, model_name, json_mode=True)
         try:
             from outputs.schema import extract_json_block
             arb = ArbitrationResult.model_validate(extract_json_block(raw))
@@ -633,6 +673,7 @@ def run_diagnostic_pipeline(
 
     if abstain_reason:
         gate_log.append("Storyteller_Agent NOT constructed - abstain path taken")
+        stage("abstain")
         tel = meter.stop()
         return DiagnosticResult(
             status="abstain",
@@ -664,8 +705,8 @@ def run_diagnostic_pipeline(
             f"Winning hypothesis: {arb.winning_hypothesis}\n"
             f"Context:\n{context_blob}\n\nReturn the JSON action now."
         )
-        raw = asyncio.run(_run_single_agent("Storyteller_Agent", story_prompt, meter))
-        action: ActionRecommendation = validate_action(raw)     # raises on bad output
+        raw = _run_single_agent("Storyteller_Agent", story_prompt, meter, model_name, json_mode=True)
+        action: ActionRecommendation = validate_action(raw)
     else:
         action = validate_action(_replay_story(watcher, arb, persona, meter))
 
@@ -843,7 +884,7 @@ def _cli() -> None:
     scenario = int(sys.argv[1]) if len(sys.argv) > 1 else 1
     persona = sys.argv[2] if len(sys.argv) > 2 else "VP of Revenue (Executive)"
 
-    mode = "LIVE (AutoGen + OpenAI)" if _llm_available() else "REPLAY (no API key)"
+    mode = "LIVE (Groq + Qwen 3.8)" if _llm_available() else "REPLAY (no API key)"
     print("=" * 74)
     print(f"ENTERPRISE BI ENGINE - scenario {scenario} - {persona}")
     print(f"mode: {mode}")

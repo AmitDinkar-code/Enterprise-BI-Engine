@@ -11,11 +11,11 @@ python-dotenv==1.2.3
 
 # --- Required transitive pins, documented rather than left to the resolver ---
 #
-# pyautogen 0.10 is a shim over the Microsoft AutoGen v0.7 packages; the OpenAI
-# model client lives in autogen-ext and is not pulled in by default.
+# Live LLM access uses the OpenAI Python SDK pointed at Groq's
+# OpenAI-compatible inference endpoint for ultra-fast Llama 3.3 70B.
 autogen-agentchat==0.7.5
 autogen-core==0.7.5
-autogen-ext[openai]==0.7.5
+openai>=1.0.0
 
 # Parses config/semantic_contract.yaml (the KPI dictionary).
 PyYAML==6.0.3

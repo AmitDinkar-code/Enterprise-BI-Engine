@@ -2,8 +2,9 @@
 Enterprise BI Engine - Streamlit executive console.
 Build Steps 3, 5 and 6.
 
-Structured diagnostic console. Not a chatbot: there is one dashboard, one
-sidebar, and no free-text input anywhere.
+WhatsApp-style agent chat feed with live, turn-based conversation between
+diagnostic agents. Not a chatbot: there is one dashboard, one sidebar, and
+no free-text input anywhere.
 
 Run:  streamlit run app.py
 """
@@ -35,18 +36,25 @@ SCENARIOS = {
     "Ambiguous Data": 2,
     "Sparse History": 3,
 }
-STAGE_LABELS = [
-    "Watcher Agent checking SQL baseline...",
-    "Researcher Agent querying unstructured logs...",
-    "Bear vs. Bull Agents debating root cause...",
-    "Storyteller synthesizing narrative...",
-]
+
+# Agent avatars for chat messages
+AVATARS = {
+    "Researcher_Agent": "🔍",
+    "Bear_Agent": "🐻",
+    "Bull_Agent": "🐂",
+    "Debate_Agent": "⚔️",
+    "Arbitrator_Agent": "⚖️",
+    "Storyteller_Agent": "📝",
+    "Watcher": "⚡",
+    "Researcher": "🔍",
+    "Gate": "🛡️",
+}
+
 ABSTAIN_BANNER = (
     "Low Confidence: Evidence is contradictory. System is abstaining from "
     "automated action recommendations."
 )
 FEEDBACK_TOAST = "Feedback logged to Persistent Memory Graph"
-TRANSCRIPT_LABEL = "View Agent Debate Transcript"
 
 st.set_page_config(
     page_title="Enterprise BI Engine",
@@ -73,6 +81,12 @@ st.markdown("""
                    Menlo, monospace; }
   .gate-line     { font-family: ui-monospace, Menlo, monospace;
                    font-size: 0.72rem; color: #3D3B47; }
+  /* Chat styling overrides for a cleaner look */
+  [data-testid="stChatMessage"] {
+    padding: 0.6rem 1rem;
+    border-radius: 12px;
+    margin-bottom: 0.4rem;
+  }
 </style>
 """, unsafe_allow_html=True)
 
@@ -85,6 +99,8 @@ def _init_state() -> None:
     defaults = {
         "current_persona": PERSONAS[0],
         "current_scenario_name": list(SCENARIOS)[0],
+        "current_mode": "Live",
+        "current_model": "qwen/qwen3.8-27b",
         "diagnostic_result": None,
         "telemetry": blank(),
         "pipeline_error": None,
@@ -107,6 +123,16 @@ def _on_persona_change() -> None:
 
 def _on_scenario_change() -> None:
     st.session_state.current_scenario_name = st.session_state.scenario_selector
+    _reset_diagnostic()
+
+
+def _on_mode_change() -> None:
+    st.session_state.current_mode = st.session_state.mode_selector
+    _reset_diagnostic()
+
+
+def _on_model_change() -> None:
+    st.session_state.current_model = st.session_state.model_selector
     _reset_diagnostic()
 
 
@@ -139,6 +165,25 @@ def _render_sidebar() -> None:
         )
 
         st.divider()
+        st.radio(
+            "Mode",
+            ["Live", "Replay"],
+            index=["Live", "Replay"].index(st.session_state.current_mode),
+            key="mode_selector",
+            on_change=_on_mode_change,
+        )
+        if st.session_state.current_mode == "Live":
+            st.selectbox(
+                "Model",
+                ["qwen/qwen3.8-27b", "qwen/qwen3.6-27b", "openai/gpt-oss-120b"],
+                index=["qwen/qwen3.8-27b", "qwen/qwen3.6-27b", "openai/gpt-oss-120b"].index(
+                    st.session_state.current_model
+                ) if st.session_state.current_model in ["qwen/qwen3.8-27b", "qwen/qwen3.6-27b", "openai/gpt-oss-120b"] else 0,
+                key="model_selector",
+                on_change=_on_model_change,
+            )
+
+        st.divider()
         st.markdown("**Runtime Telemetry**")
         tel = st.session_state.telemetry
         mode = tel.get("mode", "live")
@@ -157,13 +202,13 @@ def _render_sidebar() -> None:
         )
         if mode == "replay":
             st.caption(
-                "REPLAY MODE - no `OPENAI_API_KEY` configured. All SQL, "
+                "REPLAY MODE — no `GROQ_API_KEY` configured. All SQL, "
                 "statistics, retrieval, safety gating and schema validation "
                 "execute for real; the debate text is replayed and token counts "
                 "are estimated from transcript volume."
             )
         else:
-            st.caption(f"LIVE - {tel.get('model', '')}")
+            st.caption(f"LIVE — Groq · {tel.get('model', '')}")
 
 
 # ===========================================================================
@@ -230,46 +275,127 @@ def _render_kpis(watcher) -> None:
 
 
 # ===========================================================================
-# result rendering
+# WhatsApp-style chat result rendering
 # ===========================================================================
 
-def _render_split(result: dict[str, Any]) -> None:
-    arb = result["arbitration"]
-    i, e = arb["internal_confidence"], arb["external_confidence"]
-    st.markdown(
-        f"""
-        <div class="split-lbl"><span>INTERNAL {i}%</span>
-        <span>EXTERNAL {e}%</span></div>
-        <div class="split-bar">
-          <div class="split-int" style="width:{i}%"></div>
-          <div class="split-ext" style="width:{e}%"></div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-    if arb.get("rationale"):
-        st.caption(f"Arbitrator: {arb['rationale']}")
+def _render_chat_result() -> None:
+    """Render the diagnostic result as a WhatsApp-style agent chat thread."""
+    result = st.session_state.diagnostic_result
+    if result is None:
+        return
 
+    st.markdown("---")
+    st.markdown("#### 💬 Agent Diagnostic Thread")
 
-def _render_transcript(result: dict[str, Any]) -> None:
-    with st.expander(TRANSCRIPT_LABEL):
-        for turn in result["debate_transcript"]:
-            st.markdown(f"**{turn['agent']}**")
+    # ---- Data gathering toast (Watcher + Researcher) ----
+    watcher_data = result.get("watcher", {})
+    kpi_count = len([k for k, v in watcher_data.get("kpis", {}).items()
+                     if v.get("access_granted", True)])
+    evidence_count = len(result.get("evidence", []))
+
+    with st.chat_message("Watcher", avatar="⚡"):
+        st.markdown(
+            f"**Watcher Agent** — Computed **{kpi_count} KPIs** from SQL baseline. "
+            f"Scenario: *{watcher_data.get('scenario_label', 'N/A')}*. "
+            f"Anomaly detected: **{watcher_data.get('anomaly_detected', 'N/A')}**."
+        )
+
+    with st.chat_message("Researcher", avatar="🔍"):
+        st.markdown(
+            f"**Researcher Agent** — Retrieved **{evidence_count} evidence documents** "
+            f"from the incident window via ChromaDB vector search."
+        )
+        # Show evidence list in a compact expander
+        if result["evidence"]:
+            with st.expander("📄 Retrieved Evidence", expanded=False):
+                for ev in result["evidence"]:
+                    st.markdown(
+                        f"`{ev['id']}` &middot; {ev['source']} &middot; "
+                        f"supports **{ev['hypothesis']}** &middot; "
+                        f"distance {ev['distance']:.3f}"
+                    )
+                    st.caption(ev["text"])
+
+    # ---- Debate transcript as chat messages ----
+    for turn in result["debate_transcript"]:
+        agent = turn["agent"]
+        avatar = AVATARS.get(agent, "🤖")
+
+        # Map agent names to friendly display names
+        display_names = {
+            "Researcher_Agent": "Researcher",
+            "Bear_Agent": "Bear (Internal)",
+            "Bull_Agent": "Bull (External)",
+            "Debate_Agent": "Debate Agent",
+        }
+        display_name = display_names.get(agent, agent)
+
+        with st.chat_message(display_name, avatar=avatar):
+            st.markdown(f"**{display_name}**")
             st.write(turn["message"])
-            st.divider()
 
-        st.markdown("**Retrieved evidence**")
-        for ev in result["evidence"]:
-            st.markdown(
-                f"`{ev['id']}` &middot; {ev['source']} &middot; "
-                f"{ev['timestamp']} &middot; supports **{ev['hypothesis']}** "
-                f"&middot; distance {ev['distance']:.3f}"
+    # ---- Arbitrator verdict ----
+    arb = result["arbitration"]
+    i_conf = arb["internal_confidence"]
+    e_conf = arb["external_confidence"]
+
+    with st.chat_message("Arbitrator", avatar="⚖️"):
+        st.markdown("**Arbitrator**")
+        st.markdown(
+            f"After weighing the debate, I assign "
+            f"**Internal: {i_conf}%** vs **External: {e_conf}%**."
+        )
+
+        # Confidence split bar
+        st.markdown(
+            f"""
+            <div class="split-lbl"><span>INTERNAL {i_conf}%</span>
+            <span>EXTERNAL {e_conf}%</span></div>
+            <div class="split-bar">
+              <div class="split-int" style="width:{i_conf}%"></div>
+              <div class="split-ext" style="width:{e_conf}%"></div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        if arb.get("rationale"):
+            st.caption(f"*{arb['rationale']}*")
+
+    # ---- Python Safety Gate (structurally intact) ----
+    if result["status"] == "abstain":
+        with st.chat_message("Gate", avatar="🛡️"):
+            st.error(
+                "⛔ **Evidence is contradictory. I am abstaining from "
+                "automated action.** The Python Safety Gate has halted "
+                "execution. Manual investigation is required."
             )
-            st.caption(ev["text"])
+            if result.get("abstain_reason"):
+                st.caption(f"Reason: {result['abstain_reason']}")
 
+        # Show the abstain narrative
+        st.markdown("#### Conflicting Evidence")
+        st.markdown(result["narrative"])
+        st.info(
+            "No automated recommendation is issued in this state. "
+            "Manual investigation is required."
+        )
+    else:
+        # ---- Storyteller summary ----
+        with st.chat_message("Storyteller", avatar="📝"):
+            st.markdown("**Storyteller**")
+            st.write(result["narrative"])
 
-def _render_gate_log(result: dict[str, Any]) -> None:
-    with st.expander("Execution trace - LLM vs deterministic boundary"):
+        # ---- 7-field JSON Action Card ----
+        st.markdown("#### ✅ Action Recommendation")
+        with st.container(border=True):
+            st.success(
+                f"Schema-validated · confidence {result['confidence_score']} · "
+                f"Groq · {result.get('watcher', {}).get('scenario_label', 'N/A')}"
+            )
+            st.json(result["structured_action"])
+
+    # ---- Execution trace (preserved from original) ----
+    with st.expander("Execution trace — LLM vs deterministic boundary"):
         st.markdown(
             "Every line below was produced by **Python or SQL**, not by a "
             "language model. The gate decision is the last line."
@@ -302,6 +428,10 @@ def _render_gate_log(result: dict[str, Any]) -> None:
                 "- Storyteller narrative and action wording"
             )
 
+    # ---- HITL feedback (only if action was issued) ----
+    if result["status"] != "abstain":
+        _hitl(result)
+
 
 def _hitl(result: dict[str, Any]) -> None:
     st.markdown("**Analyst validation**")
@@ -325,65 +455,31 @@ def _hitl(result: dict[str, Any]) -> None:
                 st.rerun()
 
 
-def _render_result() -> None:
-    result = st.session_state.diagnostic_result
-    if result is None:
-        return
-
-    if result["status"] == "abstain":
-        st.error(ABSTAIN_BANNER)
-        st.markdown("#### Conflicting evidence")
-        st.markdown(result["narrative"])
-        _render_split(result)
-        st.info(
-            "No automated recommendation is issued in this state. "
-            "Manual investigation is required."
-        )
-        _render_transcript(result)
-        _render_gate_log(result)
-        return
-
-    st.markdown("#### Executive narrative")
-    st.markdown(result["narrative"])
-
-    st.markdown("#### Confidence distribution")
-    _render_split(result)
-
-    st.markdown("#### Action recommendation")
-    with st.container(border=True):
-        st.success(
-            f"Schema-validated - confidence {result['confidence_score']}"
-        )
-        st.json(result["structured_action"])
-
-    _render_transcript(result)
-    _render_gate_log(result)
-    _hitl(result)
-
-
 # ===========================================================================
 # pipeline trigger
 # ===========================================================================
 
 def _run_pipeline(persona: str, scenario: int) -> None:
-    stage_map = {
-        "watcher": 0, "researcher": 1, "debate": 2, "storyteller": 3,
-    }
     with st.status("Running diagnostics...", expanded=True) as status:
-        shown: set[int] = set()
-
         def on_stage(name: str) -> None:
-            idx = stage_map.get(name)
-            if idx is None:
-                return
-            # Emit every label up to and including this stage, in order.
-            for i in range(idx + 1):
-                if i not in shown:
-                    st.write(STAGE_LABELS[i])
-                    shown.add(i)
+            stage_labels = {
+                "watcher": "⚡ Watcher Agent checking SQL baseline...",
+                "researcher": "🔍 Researcher Agent querying logs...",
+                "debate": "⚔️ Agents debating root cause...",
+                "arbitrator": "⚖️ Arbitrator evaluating evidence...",
+                "storyteller": "📝 Storyteller generating JSON Action Plan...",
+            }
+            if name in stage_labels:
+                status.write(stage_labels[name])
 
         try:
-            result = run_diagnostic_pipeline(persona, scenario, on_stage=on_stage)
+            result = run_diagnostic_pipeline(
+                persona,
+                scenario,
+                on_stage=on_stage,
+                use_live_mode=(st.session_state.current_mode == "Live"),
+                model_name=st.session_state.current_model,
+            )
         except SchemaViolation as exc:
             status.update(label="Diagnostic failed - output contract violated",
                           state="error")
@@ -399,15 +495,10 @@ def _run_pipeline(persona: str, scenario: int) -> None:
             st.session_state.diagnostic_result = None
             return
 
-        if result.status == "abstain" and 3 not in shown:
-            st.write("Safety gate engaged - Storyteller suppressed.")
-
-        status.update(
-            label=("Diagnostic complete" if result.status == "success"
-                   else "Diagnostic complete - abstained"),
-            state="complete",
-            expanded=False,
-        )
+        if result.status == "abstain":
+            status.update(label="Diagnostics Complete (Abstained)", state="complete", expanded=False)
+        else:
+            status.update(label="Diagnostic complete", state="complete", expanded=False)
 
     st.session_state.diagnostic_result = {
         "status": result.status,
@@ -419,6 +510,7 @@ def _run_pipeline(persona: str, scenario: int) -> None:
         "arbitration": result.arbitration,
         "debate_transcript": result.debate_transcript,
         "evidence": result.evidence,
+        "watcher": result.watcher,
         "gate_log": result.gate_log,
         "abstain_reason": result.abstain_reason,
     }
@@ -467,7 +559,7 @@ def main() -> None:
     if st.session_state.pipeline_error:
         st.error(st.session_state.pipeline_error)
 
-    _render_result()
+    _render_chat_result()
 
 
 if __name__ == "__main__":

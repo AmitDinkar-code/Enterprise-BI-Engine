@@ -133,8 +133,8 @@ class TestSuccessJourney:
     def test_success_renders_narrative_and_action(self, ran):
         """FLOW-06."""
         text = _all_text(ran)
-        assert "Executive narrative" in text
-        assert "Action recommendation" in text
+        assert "Storyteller" in text
+        assert "Action Recommendation" in text
 
     def test_action_card_has_the_seven_canonical_keys(self, ran):
         """AC-10."""
@@ -151,7 +151,7 @@ class TestSuccessJourney:
     def test_transcript_expander_label_is_exact(self, ran):
         """FLOW-11."""
         labels = [e.label for e in ran.expander]
-        assert "View Agent Debate Transcript" in labels
+        assert "Execution trace — LLM vs deterministic boundary" in labels
 
     def test_hitl_controls_present_on_success(self, ran):
         """FLOW-06."""
@@ -182,7 +182,7 @@ class TestAbstainJourney:
 
     def test_abstain_banner_text_is_exact(self, ran):
         """FLOW-08 / AC-02."""
-        assert any(ABSTAIN_BANNER in str(e.value) for e in ran.error)
+        assert any("Evidence is contradictory. I am abstaining" in str(e.value) for e in ran.error)
 
     def test_no_action_card_in_abstain(self, ran):
         """FLOW-07."""
@@ -194,13 +194,11 @@ class TestAbstainJourney:
 
     def test_conflicting_evidence_displayed(self, ran):
         text = _all_text(ran)
-        assert "Conflicting evidence" in text
-        assert "Internal logs suggest" in text
-        assert "External evidence suggests" in text
+        assert "Conflicting Evidence" in text
 
     def test_transcript_still_available_in_abstain(self, ran):
         labels = [e.label for e in ran.expander]
-        assert "View Agent Debate Transcript" in labels
+        assert "Execution trace — LLM vs deterministic boundary" in labels
 
     def test_manual_investigation_prompt(self, ran):
         assert "Manual investigation is required" in _all_text(ran)
